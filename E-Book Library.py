@@ -10,7 +10,7 @@ import hashlib
 import pandas as pd
 import shutil
 from datetime import datetime, timedelta
-
+import urllib.request
 import tkinter as tk
 from tkinter import messagebox
 
@@ -25,8 +25,8 @@ DB_PATH = "library_users.db"
 
 # ---------- UI constants ----------
 WIN_GEOM = "900x640"
-POPUP_W = 620
-POPUP_H = 520
+POPUP_W = 1000
+POPUP_H = 900
 LABEL_FONT = ("Segoe UI", 13)
 HEADER_FONT = ("Segoe UI", 18, "bold")
 ENTRY_IPADY = 6
@@ -87,6 +87,76 @@ def open_pdf_in_acrobat(filepath):
             subprocess.Popen(["xdg-open", filepath])
     except Exception as e:
         messagebox.showerror("Error", f"Failed to open PDF:\n{e}")
+
+def find_pdf_in_script_dir_by_title(title: str):
+    """Search the script directory for a PDF matching the book title (best-effort)."""
+    if not title:
+        return None
+    base = os.path.dirname(__file__) or os.getcwd()
+    name = sanitize_filename(title)
+    candidates = [
+        os.path.join(base, f"{name}.pdf"),
+        os.path.join(base, f"{title}.pdf"),
+        os.path.join(base, f"{name.replace(' ', '_')}.pdf"),
+    ]
+    norm_title = normalize_text(title)
+    try:
+        for fn in os.listdir(base):
+            if not fn.lower().endswith(".pdf"):
+                continue
+            stem = os.path.splitext(fn)[0]
+            if norm_title and norm_title in normalize_text(stem):
+                p = os.path.join(base, fn)
+                if p not in candidates:
+                    candidates.insert(0, p)
+    except Exception:
+        pass
+    for c in candidates:
+        try:
+            if c and os.path.exists(c):
+                return os.path.abspath(c)
+        except Exception:
+            continue
+    return None
+
+def open_pdf_in_chrome(filepath: str) -> bool:
+    """Try to open the given PDF file with Chrome (fallback to default browser).
+       Returns True on success, False otherwise."""
+    if not filepath:
+        return False
+    fp = os.path.abspath(filepath)
+    if not os.path.exists(fp):
+        return False
+    chrome_candidates = []
+    if sys.platform.startswith("win"):
+        chrome_candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+    elif sys.platform == "darwin":
+        chrome_candidates = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+    else:
+        chrome_candidates = ["google-chrome", "chrome", "chromium", "chromium-browser"]
+
+    for p in chrome_candidates:
+        try:
+            if os.path.isabs(p) and os.path.exists(p):
+                subprocess.Popen([p, fp], shell=False)
+                return True
+            else:
+                # try by name (may be in PATH)
+                subprocess.Popen([p, fp], shell=False)
+                return True
+        except Exception:
+            continue
+    # final fallback: open file:// in default browser (Chrome will be used if it's default)
+    try:
+        url = "file://" + fp.replace("\\", "/")
+        webbrowser.open_new_tab(url)
+        return True
+    except Exception:
+        return False
+
 
 def try_open_url_in_chrome(url):
     # Try to open in Chrome if installed; otherwise fallback to default browser.
@@ -366,6 +436,7 @@ class LibraryApp:
         tb.Button(frm, text="Show All Books", bootstyle="light", width=22, command=self.show_all_books).pack(pady=8)
         tb.Button(frm, text="🔙 Back", bootstyle="secondary", width=18, command=self.create_main_menu).pack(pady=18)
 
+    # ...existing code...
     def add_book_popup(self):
         popup = tb.Toplevel(self.root)
         popup.title("Add Book")
@@ -378,17 +449,45 @@ class LibraryApp:
         title_e = tb.Entry(frm); title_e.pack(fill="x", pady=(0,8)); title_e.configure(font=("Segoe UI",12))
         tb.Label(frm, text="Author", font=LABEL_FONT).pack(anchor="w")
         author_e = tb.Entry(frm); author_e.pack(fill="x", pady=(0,8)); author_e.configure(font=("Segoe UI",12))
+
+        # Type entry with trace so we can hide/show the location field
         tb.Label(frm, text="Type ('pdf' or 'url')", font=LABEL_FONT).pack(anchor="w")
-        type_e = tb.Entry(frm); type_e.pack(fill="x", pady=(0,12)); type_e.configure(font=("Segoe UI",12))
-        tb.Label(frm, text="PDF filepath or URL", font=LABEL_FONT).pack(anchor="w")
-        loc_e = tb.Entry(frm); loc_e.pack(fill="x", pady=(0,12)); loc_e.configure(font=("Segoe UI",12))
+        type_var = tb.StringVar(value="pdf")
+        type_e = tb.Entry(frm, textvariable=type_var); type_e.pack(fill="x", pady=(0,12)); type_e.configure(font=("Segoe UI",12))
+
+        # Instruction: for PDFs, file should be placed in the script folder (no filepath required)
+        tb.Label(frm, text="For PDFs: place the .pdf file in the script folder. Filepath is optional.", font=("Segoe UI", 9)).pack(anchor="w", pady=(0,6))
+
+        # Location/frame (hidden for 'pdf' by default)
+        loc_frame = tb.Frame(frm)
+        tb.Label(loc_frame, text="PDF filepath or URL (optional)", font=LABEL_FONT).pack(anchor="w")
+        loc_e = tb.Entry(loc_frame); loc_e.pack(fill="x", pady=(0,12)); loc_e.configure(font=("Segoe UI",12))
+
+        def on_type_change(*_):
+            t = (type_var.get() or "").strip().lower()
+            if t == "pdf":
+                # hide explicit location entry (optional) — user can still paste a path if desired later
+                try:
+                    loc_frame.pack_forget()
+                except Exception:
+                    pass
+            else:
+                # show location for URLs or non-pdf types
+                try:
+                    loc_frame.pack(fill="x", pady=(0,12))
+                except Exception:
+                    pass
+
+        type_var.trace_add("write", on_type_change)
+        # initialize
+        on_type_change()
 
         def do_add():
             # reload the excel fresh to avoid closure/local variable issues
             pdf_df, ebook_df = load_excel()
             title = (title_e.get() or "").strip()
             author = (author_e.get() or "").strip()
-            typ = (type_e.get() or "").strip().lower()
+            typ = (type_var.get() or "").strip().lower()
             loc = (loc_e.get() or "").strip()
             if not title or not author or not typ:
                 messagebox.showwarning("Input", "Please fill title, author and type.")
@@ -397,6 +496,7 @@ class LibraryApp:
                 if 'title' not in pdf_df.columns: pdf_df['title'] = []
                 if 'author' not in pdf_df.columns: pdf_df['author'] = []
                 if 'filepath' not in pdf_df.columns: pdf_df['filepath'] = []
+                # if user didn't provide a filepath, leave it blank — app will search script folder by title when opening
                 new = pd.DataFrame([[title, author, loc]], columns=['title','author','filepath'])
                 pdf_df = pd.concat([pdf_df, new], ignore_index=True)
             else:
@@ -509,16 +609,28 @@ class LibraryApp:
             messagebox.showinfo("Book Selected", f"Title: {title}\nAuthor: {author}\nType: {typ}\nLocation: {loc}")
         open_search_window(self.root, data_list, title="Management: Search Books", on_select=on_select)
 
+    # ...existing code...
     def show_all_books(self):
         pdf_df, ebook_df = load_excel()
-        out = ""
+        lines = []
         if not pdf_df.empty:
-            out += "📘 Book PDFs:\n" + pdf_df.to_string(index=False) + "\n\n"
+            lines.append("📘 Book PDFs:")
+            for i, row in pdf_df.iterrows():
+                title = row.get('title') or ""
+                author = row.get('author') or ""
+                path = row.get('filepath') or row.get('path') or ""
+                lines.append(f"{i+1}. {title} — {author}" + (f" ({path})" if path else ""))
+            lines.append("")  # blank line between sections
         if not ebook_df.empty:
-            out += "🌐 E-Books:\n" + ebook_df.to_string(index=False)
-        if not out:
-            out = "No books found."
+            lines.append("🌐 E-Books:")
+            for i, row in ebook_df.iterrows():
+                title = row.get('title') or ""
+                author = row.get('author') or ""
+                url = row.get('url') or ""
+                lines.append(f"{i+1}. {title} — {author}" + (f" ({url})" if url else ""))
+        out = "\n".join(lines) if lines else "No books found."
         messagebox.showinfo("All Books", out)
+# ...existing code...
 
     # ---------- customer ----------
     def customer_entry(self):
@@ -651,13 +763,22 @@ class LibraryApp:
         lbox = tk.Listbox(list_frame, yscrollcommand=sbar.set, font=("Segoe UI", 11)); lbox.pack(side="left", fill="both", expand=True)
         sbar.config(command=lbox.yview)
 
+
+        # ...existing code...
+        # keep track of the currently shown (rendered) items so selection maps correctly
+        shown = []
+
         def render(data):
+            nonlocal shown
+            shown.clear()
             lbox.delete(0, "end")
             for i, rd in enumerate(data):
+                shown.append(rd)
                 t = str(rd.get('title') or "")
                 a = str(rd.get('author') or "")
                 typ = "PDF" if rd.get('source') == 'pdf' else "Online"
                 lbox.insert("end", f"{i}: {t} — {a}  ({typ})")
+
         render(display_list)
 
         def filter_reorder(_=None):
@@ -667,16 +788,16 @@ class LibraryApp:
             matched = [rd for rd in display_list if q in str(rd.get('title') or "").lower()]
             others = [rd for rd in display_list if rd not in matched]
             render(matched + others)
+
         search_entry.bind("<KeyRelease>", filter_reorder)
 
         def fill_from_select(evt):
             sel = lbox.curselection()
-            if not sel: return
-            text = lbox.get(sel[0])
-            try: idx = int(text.split(":",1)[0])
-            except: idx = sel[0]
-            if 0 <= idx < len(display_list):
-                search_var.set(str(display_list[idx].get('title') or ""))
+            if not sel:
+                return
+            idx = sel[0]  # index into the currently shown list
+            if 0 <= idx < len(shown):
+                search_var.set(str(shown[idx].get('title') or ""))
         lbox.bind("<<ListboxSelect>>", fill_from_select)
 
         def get_chosen_by_title():
@@ -684,15 +805,24 @@ class LibraryApp:
             if not q:
                 messagebox.showwarning("Select", "Type or choose a book title in the search box first.")
                 return None
-            for rd in display_list:
+            # prefer exact match among currently shown items, then fall back to full list
+            for rd in shown:
                 if q == str(rd.get('title') or "").strip().lower():
                     return rd
             for rd in display_list:
-                if q in (str(rd.get('title') or "").strip().lower()):
+                if q == str(rd.get('title') or "").strip().lower():
                     return rd
-            messagebox.showerror("Not found", "No book exactly matching the search entry.")
+            # then try partial matches (shown first)
+            for rd in shown:
+                if q in str(rd.get('title') or "").strip().lower():
+                    return rd
+            for rd in display_list:
+                if q in str(rd.get('title') or "").strip().lower():
+                    return rd
+            messagebox.showerror("Not found", "No book matching the search entry.")
             return None
 
+        # ...existing code...
         def action_read():
             rd = get_chosen_by_title()
             if not rd: return
@@ -700,11 +830,20 @@ class LibraryApp:
                 filepath = ""
                 for col in ['filepath','path','file path','file','file_path']:
                     if col in rd and rd.get(col):
-                        filepath = str(rd.get(col)).strip(); break
+                        filepath = str(rd.get(col)).strip()
+                        break
                 if filepath and os.path.exists(filepath):
-                    open_pdf_in_acrobat(filepath)
-                else:
-                    messagebox.showerror("Not found", f"PDF not found:\n{filepath}")
+                    if not open_pdf_in_chrome(filepath):
+                        open_pdf_in_acrobat(filepath)
+                    return
+                # fallback: search script directory by title only
+                title = str(rd.get('title') or "").strip()
+                found = find_pdf_in_script_dir_by_title(title)
+                if found:
+                    if not open_pdf_in_chrome(found):
+                        open_pdf_in_acrobat(found)
+                    return
+                messagebox.showerror("Not found", f"PDF not found:\n{filepath or '(no stored path)'}\nSearched script folder for '{title}'.")
             else:
                 url = ""
                 for col in ['url','link','website']:
@@ -832,16 +971,32 @@ class LibraryApp:
 
         def open_issued():
             sel = lb_issued.curselection()
-            if not sel: messagebox.showwarning("Select", "Select an issued book."); return
+            if not sel:
+                messagebox.showwarning("Select", "Select an issued book.")
+                return
             label = lb_issued.get(sel[0]); info = issued_map.get(label)
-            if not info: messagebox.showerror("Error", "Info missing."); return
-            if info['source']=='pdf':
-                if info['location'] and os.path.exists(info['location']): open_pdf_in_acrobat(info['location'])
-                else: messagebox.showerror("Missing", "PDF file not found.")
+            if not info:
+                messagebox.showerror("Error", "Info missing."); return
+            if info['source'] == 'pdf':
+                loc = info.get('location') or ""
+                if loc and os.path.exists(loc):
+                    if not open_pdf_in_chrome(loc):
+                        open_pdf_in_acrobat(loc)
+                    return
+                # fallback: search script directory by title only
+                found = find_pdf_in_script_dir_by_title(info.get('title'))
+                if found:
+                    if not open_pdf_in_chrome(found):
+                        open_pdf_in_acrobat(found)
+                    return
+                messagebox.showerror("Missing", f"PDF not found for '{info.get('title')}'.\nSearched stored path and script folder.")
             else:
-                if info['location'] and (info['location'].startswith("http://") or info['location'].startswith("https://")): try_open_url_in_chrome(info['location'])
-                else: messagebox.showerror("Missing", "URL missing/invalid.")
+                if info.get('location') and (info['location'].startswith("http://") or info['location'].startswith("https://")):
+                    try_open_url_in_chrome(info['location'])
+                else:
+                    messagebox.showerror("Missing", "URL missing/invalid.")
 
+        
         def return_issued():
             sel = lb_issued.curselection()
             if not sel: messagebox.showwarning("Select", "Select an issued book to return."); return
@@ -850,39 +1005,104 @@ class LibraryApp:
             conn = sqlite3.connect(DB_PATH); c = conn.cursor(); c.execute("DELETE FROM issued_books WHERE id=?", (info['id'],)); conn.commit(); conn.close()
             messagebox.showinfo("Returned", f"'{info['title']}' returned successfully."); lb_issued.delete(sel[0])
 
+
         def open_purchased():
             sel = lb_purchased.curselection()
-            if not sel: messagebox.showwarning("Select", "Select a purchased book."); return
+            if not sel:
+                messagebox.showwarning("Select", "Select a purchased book.")
+                return
             label = lb_purchased.get(sel[0]); info = purchased_map.get(label)
-            if not info: messagebox.showerror("Error", "Info missing."); return
-            if info['source']=='pdf':
-                if info['location'] and os.path.exists(info['location']): open_pdf_in_acrobat(info['location'])
-                else:
-                    downloads = get_downloads_folder(); candidate = os.path.join(downloads, f"{sanitize_filename(info['title'])}.pdf")
-                    if os.path.exists(candidate): open_pdf_in_acrobat(candidate)
-                    else: messagebox.showerror("Missing", "PDF not found locally.")
+            if not info:
+                messagebox.showerror("Error", "Info missing."); return
+            if info['source'] == 'pdf':
+                loc = info.get('location') or ""
+                if loc and os.path.exists(loc):
+                    if not open_pdf_in_chrome(loc):
+                        open_pdf_in_acrobat(loc)
+                    return
+                # try Downloads by sanitized title
+                downloads = get_downloads_folder()
+                candidate = os.path.join(downloads, f"{sanitize_filename(info.get('title'))}.pdf")
+                if os.path.exists(candidate):
+                    if not open_pdf_in_chrome(candidate):
+                        open_pdf_in_acrobat(candidate)
+                    return
+                # final fallback: search script folder by title
+                found = find_pdf_in_script_dir_by_title(info.get('title'))
+                if found:
+                    if not open_pdf_in_chrome(found):
+                        open_pdf_in_acrobat(found)
+                    return
+                messagebox.showerror("Missing", f"PDF not found for '{info.get('title')}'.")
             else:
-                if info['location'] and (info['location'].startswith("http://") or info['location'].startswith("https://")): try_open_url_in_chrome(info['location'])
-                else: messagebox.showerror("Missing", "URL missing/invalid.")
+                if info.get('location') and (info['location'].startswith("http://") or info['location'].startswith("https://")):
+                    try_open_url_in_chrome(info['location'])
+                else:
+                    messagebox.showerror("Missing", "URL missing/invalid.")
 
         def download_purchased():
             sel = lb_purchased.curselection()
-            if not sel: messagebox.showwarning("Select", "Select a purchased book."); return
+            if not sel:
+                messagebox.showwarning("Select", "Select a purchased book."); return
             label = lb_purchased.get(sel[0]); info = purchased_map.get(label)
-            if not info: messagebox.showerror("Error", "Info missing."); return
-            if info['source']!='pdf': messagebox.showinfo("Not Available", "This item is not a downloadable PDF."); return
-            src = info['location']
-            if not src or not os.path.exists(src): messagebox.showerror("Missing", "Original PDF path missing."); return
-            downloads = get_downloads_folder(); dst = os.path.join(downloads, f"{sanitize_filename(info['title'])}.pdf")
-            try: shutil.copy2(src, dst); messagebox.showinfo("Downloaded", f"✅ Book downloaded to:\n{dst}")
-            except Exception as e: messagebox.showerror("Error", f"Download failed:\n{e}")
+            if not info:
+                messagebox.showerror("Error", "Info missing."); return
+            if info.get('source') != 'pdf':
+                messagebox.showinfo("Not Available", "This item is not a downloadable PDF."); return
 
+            title = str(info.get('title') or "book").strip()
+            src = (info.get('location') or "").strip()
+            downloads = get_downloads_folder()
+            try:
+                os.makedirs(downloads, exist_ok=True)
+            except Exception:
+                pass
+            dst = os.path.join(downloads, f"{sanitize_filename(title)}.pdf")
+
+            tried = []
+            try:
+                # 1) Try stored path (absolute or relative to script dir)
+                if src:
+                    candidate = os.path.expanduser(src)
+                    if not os.path.isabs(candidate):
+                        base = os.path.dirname(__file__) or os.getcwd()
+                        candidate = os.path.join(base, candidate)
+                    tried.append(candidate)
+                    if os.path.exists(candidate) and os.path.isfile(candidate):
+                        shutil.copy2(candidate, dst)
+                        messagebox.showinfo("Downloaded", f"✅ Book downloaded to:\n{dst}")
+                        return
+
+                # 2) If src is a URL, attempt to download it
+                if src and (src.startswith("http://") or src.startswith("https://")):
+                    try:
+                        urllib.request.urlretrieve(src, dst)
+                        messagebox.showinfo("Downloaded", f"✅ Book downloaded to:\n{dst}")
+                        return
+                    except Exception as e:
+                        tried.append(src)
+
+                # 3) Fallback: search script directory by title (best-effort)
+                found = find_pdf_in_script_dir_by_title(title)
+                if found:
+                    shutil.copy2(found, dst)
+                    messagebox.showinfo("Downloaded", f"✅ Book downloaded to:\n{dst}")
+                    return
+
+                # Nothing worked
+                details = "\n".join(tried) if tried else "(no candidate paths)"
+                messagebox.showerror("Missing", f"Could not locate original PDF for '{title}'.\nTried:\n{details}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Download failed:\n{e}")
+
+        # bottom button frame (packed AFTER content_frame so it appears under the lists)
+        # ...existing code...
         # bottom button frame (packed AFTER content_frame so it appears under the lists)
         bframe = tb.Frame(frm)
         bframe.pack(fill="x", pady=(6,4), padx=6)
-        tb.Button(bframe, text="Open Issued", bootstyle="primary", width=BTN_WIDTH, command=open_issued).grid(row=0,column=0,padx=6)
+        tb.Button(bframe, text="Read Issued", bootstyle="primary", width=BTN_WIDTH, command=open_issued).grid(row=0,column=0,padx=6)
         tb.Button(bframe, text="Return Issued", bootstyle="secondary", width=BTN_WIDTH, command=return_issued).grid(row=0,column=1,padx=6)
-        tb.Button(bframe, text="Open Purchased", bootstyle="primary", width=BTN_WIDTH, command=open_purchased).grid(row=0,column=2,padx=6)
+        tb.Button(bframe, text="Read Purchased", bootstyle="primary", width=BTN_WIDTH, command=open_purchased).grid(row=0,column=2,padx=6)
         tb.Button(bframe, text="Download Purchased", bootstyle="success", width=BTN_WIDTH, command=download_purchased).grid(row=0,column=3,padx=6)
         tb.Button(bframe, text="Close", bootstyle="light", width=BTN_WIDTH, command=win.destroy).grid(row=0,column=4,padx=6)
 

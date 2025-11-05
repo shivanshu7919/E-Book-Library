@@ -10,13 +10,15 @@ import hashlib
 import pandas as pd
 import shutil
 from datetime import datetime, timedelta
+
 import tkinter as tk
 from tkinter import messagebox
+
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 
 # ---------- CONFIG ----------
-EXCEL_PATH = os.path.join(os.path.dirname(__file__), "Books.xlsx")
+EXCEL_PATH = os.path.join(os.path.dirname(__file__), "Books.xlsx")  # Excel is in the same folder as the script
 SHEET_BOOK_PDF = "Book PDF"
 SHEET_EBOOK = "E-Book"
 DB_PATH = "library_users.db"
@@ -39,12 +41,24 @@ def normalize_text(text):
     return " ".join(text.split()).lower().strip()
 
 def sanitize_filename(name: str) -> str:
+    # remove characters not allowed in filenames, limit length
     name = (name or "").strip()
     name = re.sub(r'[\/\\\:\*\?"<>\|]', "", name)
     name = re.sub(r'\s+', ' ', name)
     if len(name) > 150:
         name = name[:150]
     return name
+
+def get_downloads_folder():
+    # Cross-platform downloads detection (best effort)
+    home = os.path.expanduser("~")
+    if sys.platform.startswith("win"):
+        return os.path.join(home, "Downloads")
+    elif sys.platform == "darwin":
+        return os.path.join(home, "Downloads")
+    else:
+        # linux/unix
+        return os.path.join(home, "Downloads")
 
 def open_pdf_in_acrobat(filepath):
     filepath = os.path.abspath(filepath)
@@ -53,6 +67,7 @@ def open_pdf_in_acrobat(filepath):
         return
     try:
         if sys.platform.startswith("win"):
+            # Prefer Adobe if available
             acrobat_paths = [
                 r"C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
                 r"C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
@@ -63,15 +78,20 @@ def open_pdf_in_acrobat(filepath):
                 if os.path.exists(p):
                     subprocess.Popen([p, filepath], shell=False)
                     return
+            # fallback
             os.startfile(filepath)
         elif sys.platform == "darwin":
             subprocess.Popen(["open", filepath])
         else:
+            # linux - try xdg-open
             subprocess.Popen(["xdg-open", filepath])
     except Exception as e:
         messagebox.showerror("Error", f"Failed to open PDF:\n{e}")
 
 def try_open_url_in_chrome(url):
+    # Try to open in Chrome if installed; otherwise fallback to default browser.
+    # Search common chrome locations (Windows) or 'google-chrome' binary (linux/mac).
+    url = str(url)
     if not (url.startswith("http://") or url.startswith("https://")):
         messagebox.showerror("Invalid URL", f"Invalid URL:\n{url}")
         return
@@ -84,27 +104,41 @@ def try_open_url_in_chrome(url):
     elif sys.platform == "darwin":
         chrome_candidates = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
     else:
+        # linux: rely on typical binary names in PATH
         chrome_candidates = ["google-chrome", "chrome", "chromium", "chromium-browser"]
+
     for p in chrome_candidates:
         try:
             if os.path.isabs(p) and os.path.exists(p):
                 subprocess.Popen([p, url], shell=False)
                 return
             else:
+                # try to run by name (may be in PATH)
                 subprocess.Popen([p, url], shell=False)
                 return
         except Exception:
             continue
+    # final fallback
     webbrowser.open(url)
 
 def ensure_excel_exists():
+    folder = os.path.dirname(EXCEL_PATH)
+    if folder and not os.path.exists(folder):
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except Exception:
+            pass
     if not os.path.exists(EXCEL_PATH):
         pdf_df = pd.DataFrame(columns=["title", "author", "filepath"])
         ebook_df = pd.DataFrame(columns=["title", "author", "url"])
-        with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl") as writer:
-            pdf_df.to_excel(writer, index=False, sheet_name=SHEET_BOOK_PDF)
-            ebook_df.to_excel(writer, index=False, sheet_name=SHEET_EBOOK)
+        try:
+            with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl") as writer:
+                pdf_df.to_excel(writer, index=False, sheet_name=SHEET_BOOK_PDF)
+                ebook_df.to_excel(writer, index=False, sheet_name=SHEET_EBOOK)
+        except Exception as e:
+            print("Failed to create initial Excel:", e)
 
+# ---------- DB init ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -136,28 +170,134 @@ def init_db():
     conn.close()
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256((password or "").encode("utf-8")).hexdigest()
+    if password is None:
+        password = ""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
+# ---------- Excel helpers ----------
 def load_excel():
     if not os.path.exists(EXCEL_PATH):
+        messagebox.showerror("Error", f"Excel file not found at:\n{EXCEL_PATH}")
         return pd.DataFrame(), pd.DataFrame()
-    xls = pd.ExcelFile(EXCEL_PATH)
-    pdf_df = pd.read_excel(xls, sheet_name=SHEET_BOOK_PDF)
-    ebook_df = pd.read_excel(xls, sheet_name=SHEET_EBOOK)
-    pdf_df.columns = [c.lower().strip() for c in pdf_df.columns]
-    ebook_df.columns = [c.lower().strip() for c in ebook_df.columns]
-    return pdf_df, ebook_df
+    try:
+        xls = pd.ExcelFile(EXCEL_PATH)
+        sheets = xls.sheet_names
+        pdf_sheet = SHEET_BOOK_PDF if SHEET_BOOK_PDF in sheets else (sheets[0] if len(sheets) >= 1 else None)
+        ebook_sheet = SHEET_EBOOK if SHEET_EBOOK in sheets else (sheets[1] if len(sheets) >= 2 else None)
+        pdf_df = pd.read_excel(xls, sheet_name=pdf_sheet) if pdf_sheet else pd.DataFrame()
+        ebook_df = pd.read_excel(xls, sheet_name=ebook_sheet) if ebook_sheet else pd.DataFrame()
+        pdf_df.columns = [c.lower().strip() for c in pdf_df.columns]
+        ebook_df.columns = [c.lower().strip() for c in ebook_df.columns]
+        return pdf_df, ebook_df
+    except Exception as e:
+        messagebox.showerror("Error loading Excel", str(e))
+        return pd.DataFrame(), pd.DataFrame()
 
 def save_excel(pdf_df, ebook_df):
-    with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl", mode="w") as writer:
-        pdf_df.to_excel(writer, index=False, sheet_name=SHEET_BOOK_PDF)
-        ebook_df.to_excel(writer, index=False, sheet_name=SHEET_EBOOK)
+    try:
+        with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl", mode="w") as writer:
+            pdf_df.to_excel(writer, index=False, sheet_name=SHEET_BOOK_PDF)
+            ebook_df.to_excel(writer, index=False, sheet_name=SHEET_EBOOK)
+        messagebox.showinfo("Saved", "Excel file updated.")
+    except Exception as e:
+        messagebox.showerror("Error saving Excel", str(e))
 
-# ---------- App ----------
+# ---------- Reusable searchable window ----------
+def open_search_window(master, data_list, title="Search Books", on_select=None):
+    win = tb.Toplevel(master)
+    win.title(title)
+    win.geometry(f"{POPUP_W}x{POPUP_H}")
+    win.resizable(False, False)
+
+    header = tb.Frame(win, padding=12)
+    header.pack(fill="x")
+    tb.Label(header, text=title, font=HEADER_FONT).pack(anchor="w")
+
+    search_var = tb.StringVar()
+    search_entry = tb.Entry(win, textvariable=search_var)
+    search_entry.pack(fill="x", padx=12, pady=(6,8))
+    search_entry.configure(font=("Segoe UI", 12))
+
+    list_frame = tb.Frame(win)
+    list_frame.pack(fill="both", expand=True, padx=12, pady=(0,8))
+
+    scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+    scrollbar.pack(side="right", fill="y")
+    listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, font=("Segoe UI", 11))
+    listbox.pack(side="left", fill="both", expand=True)
+    scrollbar.config(command=listbox.yview)
+
+    working = []
+    for item in data_list:
+        if isinstance(item, dict):
+            working.append(item.copy())
+        else:
+            working.append({k: (None if pd.isna(v) else v) for k, v in item.items()})
+
+    def render(items):
+        listbox.delete(0, "end")
+        for idx, rd in enumerate(items):
+            t = str(rd.get('title') or "")
+            a = str(rd.get('author') or "")
+            typ = "PDF" if rd.get('source') == 'pdf' else "Online"
+            listbox.insert("end", f"{idx}: {t} — {a}  ({typ})")
+
+    def filter_reorder(_=None):
+        q = search_var.get().strip().lower()
+        if not q:
+            render(working)
+            return
+        matched = [rd for rd in working if q in str(rd.get('title') or "").lower()]
+        others = [rd for rd in working if rd not in matched]
+        render(matched + others)
+
+    render(working)
+    search_entry.bind("<KeyRelease>", filter_reorder)
+
+    def fill_with_select(evt):
+        sel = listbox.curselection()
+        if not sel:
+            return
+        text = listbox.get(sel[0])
+        try:
+            selected_index = int(text.split(":", 1)[0])
+        except Exception:
+            selected_index = sel[0]
+        if selected_index < 0 or selected_index >= len(working):
+            return
+        chosen = working[selected_index]
+        search_var.set(str(chosen.get('title') or ""))
+
+    listbox.bind("<<ListboxSelect>>", fill_with_select)
+
+    def do_select():
+        sel = listbox.curselection()
+        if not sel:
+            messagebox.showwarning("Select", "Please select a book from the list first.")
+            return
+        text = listbox.get(sel[0])
+        try:
+            selected_index = int(text.split(":", 1)[0])
+        except Exception:
+            selected_index = sel[0]
+        chosen = working[selected_index]
+        if on_select:
+            on_select(chosen)
+        win.destroy()
+
+    btns = tb.Frame(win, padding=8)
+    btns.pack(fill="x")
+    tb.Button(btns, text="Select", bootstyle="success", width=BTN_WIDTH, command=do_select).pack(side="left", padx=6)
+    tb.Button(btns, text="Close", bootstyle="secondary", width=BTN_WIDTH, command=win.destroy).pack(side="right", padx=6)
+
+    return win
+
+# ---------- Application ----------
 class LibraryApp:
     def __init__(self):
         ensure_excel_exists()
         init_db()
+        # Use a dark theme: 'darkly' is a good dark theme in ttkbootstrap
         self.root = tb.Window(themename="darkly")
         self.root.title("E-Book Library System")
         self.root.geometry(WIN_GEOM)
@@ -166,133 +306,222 @@ class LibraryApp:
         self.cleanup_expired_issues_on_startup()
         self.create_main_menu()
 
-    def run(self):
-        self.root.mainloop()
-
     def create_main_menu(self):
         for w in self.root.winfo_children():
             w.destroy()
         frame = tb.Frame(self.root, padding=26)
         frame.pack(fill="both", expand=True)
         tb.Label(frame, text="📚 E-Book Library System", font=("Segoe UI", 24, "bold")).pack(pady=(8, 18))
-        tb.Button(frame, text="Management", bootstyle="info", width=24, command=self.management_menu).pack(pady=10)
-        tb.Button(frame, text="Customer", bootstyle="primary", width=24, command=self.customer_menu).pack(pady=10)
+        tb.Button(frame, text="Management", bootstyle="info", width=24, command=self.management_login).pack(pady=10)
+        tb.Button(frame, text="Customer", bootstyle="primary", width=24, command=self.customer_entry).pack(pady=10)
         tb.Button(frame, text="Exit", bootstyle="danger", width=24, command=self.root.destroy).pack(pady=30)
 
-    # ---------- MANAGEMENT ----------
-    def management_menu(self):
-        win = tb.Toplevel(self.root)
-        win.title("Management Menu")
-        win.geometry(f"{POPUP_W}x{POPUP_H}")
-        tb.Label(win, text="Management Options", font=HEADER_FONT).pack(pady=10)
-        tb.Button(win, text="Add Book", width=BTN_WIDTH, command=self.add_book).pack(pady=5)
-        tb.Button(win, text="Delete Book", width=BTN_WIDTH, command=self.delete_book).pack(pady=5)
-        tb.Button(win, text="Search Book", width=BTN_WIDTH, command=self.search_book).pack(pady=5)
-        tb.Button(win, text="Show All Books", width=BTN_WIDTH, command=self.show_all_books).pack(pady=5)
-        tb.Button(win, text="Close", bootstyle="danger", width=BTN_WIDTH, command=win.destroy).pack(pady=15)
+    # ---------- management ----------
+    def management_login(self):
+        popup = tb.Toplevel(self.root)
+        popup.title("Management Login")
+        popup.geometry(f"{POPUP_W}x{POPUP_H}")
+        popup.resizable(False, False)
+        frm = tb.Frame(popup, padding=18)
+        frm.pack(fill="both", expand=True)
+        tb.Label(frm, text="Management Login", font=HEADER_FONT).pack(pady=(0,14))
+        tb.Label(frm, text="Username", font=LABEL_FONT).pack(anchor="w")
+        user_entry = tb.Entry(frm)
+        user_entry.pack(fill="x", pady=(0,8))
+        user_entry.configure(font=("Segoe UI", 12))
+        tb.Label(frm, text="Password", font=LABEL_FONT).pack(anchor="w")
+        pwd_entry = tb.Entry(frm, show="*")
+        pwd_entry.pack(fill="x", pady=(0,12))
+        pwd_entry.configure(font=("Segoe UI", 12))
 
-    def add_book(self):
-        win = tb.Toplevel(self.root)
-        win.title("Add Book")
-        win.geometry("520x420")
-        tb.Label(win, text="Add Book", font=HEADER_FONT).pack(pady=10)
-        tb.Label(win, text="Type:").pack()
-        type_var = tb.StringVar(value="pdf")
-        tb.Radiobutton(win, text="PDF", variable=type_var, value="pdf").pack()
-        tb.Radiobutton(win, text="E-Book", variable=type_var, value="ebook").pack()
-        tb.Label(win, text="Title:").pack()
-        title_entry = tb.Entry(win)
-        title_entry.pack()
-        tb.Label(win, text="Author:").pack()
-        author_entry = tb.Entry(win)
-        author_entry.pack()
-        tb.Label(win, text="Filepath or URL:").pack()
-        loc_entry = tb.Entry(win)
-        loc_entry.pack()
-
-        def save_book():
-            title, author, loc = title_entry.get().strip(), author_entry.get().strip(), loc_entry.get().strip()
-            if not title or not author or not loc:
-                messagebox.showerror("Error", "All fields are required.")
+        def do_login():
+            user = (user_entry.get() or "").strip()
+            pwd = (pwd_entry.get() or "").strip()
+            if not user or not pwd:
+                messagebox.showwarning("Input", "Both fields are required.")
                 return
-            pdf_df, ebook_df = load_excel()
-            if type_var.get() == "pdf":
-                pdf_df.loc[len(pdf_df)] = [title, author, loc]
+            # Simple management check: a specific management username/password
+            # NOTE: keep this limited. For production, create admin users in DB with proper privilege management.
+            if user.lower() == "shiva_007".lower() and pwd == "12345":
+                popup.destroy()
+                self.management_panel()
             else:
-                ebook_df.loc[len(ebook_df)] = [title, author, loc]
+                messagebox.showerror("Access Denied", "Invalid credentials. Access denied.")
+
+        btns = tb.Frame(frm)
+        btns.pack(fill="x", pady=(8,0))
+        tb.Button(btns, text="Login", bootstyle="primary", width=BTN_WIDTH, command=do_login).pack(side="left", padx=8)
+        tb.Button(btns, text="Back", bootstyle="secondary", width=BTN_WIDTH, command=popup.destroy).pack(side="right", padx=8)
+
+    def management_panel(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+        frm = tb.Frame(self.root, padding=18)
+        frm.pack(fill="both", expand=True)
+        tb.Label(frm, text="Management Panel", font=HEADER_FONT).pack(pady=(0,12))
+        tb.Button(frm, text="Add Book", bootstyle="success", width=22, command=self.add_book_popup).pack(pady=8)
+        tb.Button(frm, text="Delete Book", bootstyle="danger", width=22, command=self.delete_book_popup).pack(pady=8)
+        tb.Button(frm, text="Modify Book", bootstyle="info", width=22, command=self.modify_book_popup).pack(pady=8)
+        tb.Button(frm, text="Search Books", bootstyle="secondary", width=22, command=self.management_search).pack(pady=8)
+        tb.Button(frm, text="Show All Books", bootstyle="light", width=22, command=self.show_all_books).pack(pady=8)
+        tb.Button(frm, text="🔙 Back", bootstyle="secondary", width=18, command=self.create_main_menu).pack(pady=18)
+
+    def add_book_popup(self):
+        popup = tb.Toplevel(self.root)
+        popup.title("Add Book")
+        popup.geometry(f"{POPUP_W}x{POPUP_H}")
+        popup.resizable(False, False)
+        frm = tb.Frame(popup, padding=18)
+        frm.pack(fill="both", expand=True)
+        tb.Label(frm, text="Add Book", font=HEADER_FONT).pack(pady=(0,12))
+        tb.Label(frm, text="Title", font=LABEL_FONT).pack(anchor="w")
+        title_e = tb.Entry(frm); title_e.pack(fill="x", pady=(0,8)); title_e.configure(font=("Segoe UI",12))
+        tb.Label(frm, text="Author", font=LABEL_FONT).pack(anchor="w")
+        author_e = tb.Entry(frm); author_e.pack(fill="x", pady=(0,8)); author_e.configure(font=("Segoe UI",12))
+        tb.Label(frm, text="Type ('pdf' or 'url')", font=LABEL_FONT).pack(anchor="w")
+        type_e = tb.Entry(frm); type_e.pack(fill="x", pady=(0,12)); type_e.configure(font=("Segoe UI",12))
+        tb.Label(frm, text="PDF filepath or URL", font=LABEL_FONT).pack(anchor="w")
+        loc_e = tb.Entry(frm); loc_e.pack(fill="x", pady=(0,12)); loc_e.configure(font=("Segoe UI",12))
+
+        def do_add():
+            # reload the excel fresh to avoid closure/local variable issues
+            pdf_df, ebook_df = load_excel()
+            title = (title_e.get() or "").strip()
+            author = (author_e.get() or "").strip()
+            typ = (type_e.get() or "").strip().lower()
+            loc = (loc_e.get() or "").strip()
+            if not title or not author or not typ:
+                messagebox.showwarning("Input", "Please fill title, author and type.")
+                return
+            if typ == "pdf":
+                if 'title' not in pdf_df.columns: pdf_df['title'] = []
+                if 'author' not in pdf_df.columns: pdf_df['author'] = []
+                if 'filepath' not in pdf_df.columns: pdf_df['filepath'] = []
+                new = pd.DataFrame([[title, author, loc]], columns=['title','author','filepath'])
+                pdf_df = pd.concat([pdf_df, new], ignore_index=True)
+            else:
+                if 'title' not in ebook_df.columns: ebook_df['title'] = []
+                if 'author' not in ebook_df.columns: ebook_df['author'] = []
+                if 'url' not in ebook_df.columns: ebook_df['url'] = []
+                new = pd.DataFrame([[title, author, loc]], columns=['title','author','url'])
+                ebook_df = pd.concat([ebook_df, new], ignore_index=True)
             save_excel(pdf_df, ebook_df)
-            messagebox.showinfo("Success", "Book added successfully.")
-            win.destroy()
+            popup.destroy()
 
-        tb.Button(win, text="Save", bootstyle="success", command=save_book).pack(pady=15)
+        btns = tb.Frame(frm)
+        btns.pack(fill="x", pady=(6,0))
+        tb.Button(btns, text="Add Book", bootstyle="success", width=BTN_WIDTH, command=do_add).pack(side="left", padx=6)
+        tb.Button(btns, text="Cancel", bootstyle="secondary", width=BTN_WIDTH, command=popup.destroy).pack(side="right", padx=6)
 
-    def delete_book(self):
-        pdf_df, ebook_df = load_excel()
-        win = tb.Toplevel(self.root)
-        win.title("Delete Book")
-        win.geometry("400x300")
-        tb.Label(win, text="Enter Title to Delete:", font=LABEL_FONT).pack(pady=10)
-        title_var = tb.StringVar()
-        tb.Entry(win, textvariable=title_var).pack(pady=5)
+    def delete_book_popup(self):
+        popup = tb.Toplevel(self.root)
+        popup.title("Delete Book")
+        popup.geometry(f"{POPUP_W}x420")
+        popup.resizable(False, False)
+        frm = tb.Frame(popup, padding=18)
+        frm.pack(fill="both", expand=True)
+        tb.Label(frm, text="Delete Book", font=HEADER_FONT).pack(pady=(0,12))
+        tb.Label(frm, text="Enter exact Title to delete", font=LABEL_FONT).pack(anchor="w")
+        t_e = tb.Entry(frm); t_e.pack(fill="x", pady=(0,12)); t_e.configure(font=("Segoe UI",12))
 
-        def confirm_delete():
-            title = normalize_text(title_var.get())
-            pdf_df2 = pdf_df[~pdf_df["title"].apply(normalize_text).str.contains(title, na=False)]
-            ebook_df2 = ebook_df[~ebook_df["title"].apply(normalize_text).str.contains(title, na=False)]
+        def do_delete():
+            title = (t_e.get() or "").strip()
+            if not title:
+                messagebox.showwarning("Input", "Please enter title.")
+                return
+            pdf_df2, ebook_df2 = load_excel()
+            # guard if columns absent
+            if 'title' in pdf_df2.columns:
+                pdf_df2 = pdf_df2[~(pdf_df2.get('title','').astype(str).str.lower() == title.lower())]
+            if 'title' in ebook_df2.columns:
+                ebook_df2 = ebook_df2[~(ebook_df2.get('title','').astype(str).str.lower() == title.lower())]
             save_excel(pdf_df2, ebook_df2)
-            messagebox.showinfo("Deleted", "Book deleted (if existed).")
-            win.destroy()
+            popup.destroy()
 
-        tb.Button(win, text="Delete", bootstyle="danger", command=confirm_delete).pack(pady=15)
+        btns = tb.Frame(frm)
+        btns.pack(fill="x", pady=(6,0))
+        tb.Button(btns, text="Delete", bootstyle="danger", width=BTN_WIDTH, command=do_delete).pack(side="left", padx=6)
+        tb.Button(btns, text="Cancel", bootstyle="secondary", width=BTN_WIDTH, command=popup.destroy).pack(side="right", padx=6)
 
-    def search_book(self):
+    def modify_book_popup(self):
+        popup = tb.Toplevel(self.root)
+        popup.title("Modify Book - Choose & Edit")
+        popup.geometry(f"{POPUP_W}x{POPUP_H}")
+        popup.resizable(False, False)
+        frm = tb.Frame(popup, padding=18); frm.pack(fill="both", expand=True)
+        tb.Label(frm, text="Modify Book - Choose & Edit", font=HEADER_FONT).pack(pady=(0,12))
+        tb.Label(frm, text="Existing Title", font=LABEL_FONT).pack(anchor="w")
+        old_e = tb.Entry(frm); old_e.pack(fill="x", pady=(0,8)); old_e.configure(font=("Segoe UI",12))
+        tb.Label(frm, text="New Title (leave blank to keep)", font=LABEL_FONT).pack(anchor="w")
+        new_t_e = tb.Entry(frm); new_t_e.pack(fill="x", pady=(0,8)); new_t_e.configure(font=("Segoe UI",12))
+        tb.Label(frm, text="New Author (leave blank to keep)", font=LABEL_FONT).pack(anchor="w")
+        new_a_e = tb.Entry(frm); new_a_e.pack(fill="x", pady=(0,12)); new_a_e.configure(font=("Segoe UI",12))
+
+        def do_modify():
+            old_title = (old_e.get() or "").strip()
+            if not old_title:
+                messagebox.showwarning("Input", "Existing title required.")
+                return
+            new_title = (new_t_e.get() or "").strip()
+            new_author = (new_a_e.get() or "").strip()
+            pdf_df2, ebook_df2 = load_excel()
+            modified = False
+            if 'title' in pdf_df2.columns:
+                mask = pdf_df2['title'].astype(str).str.lower() == old_title.lower()
+                if mask.any():
+                    if new_title: pdf_df2.loc[mask, 'title'] = new_title
+                    if new_author: pdf_df2.loc[mask, 'author'] = new_author
+                    modified = True
+            if 'title' in ebook_df2.columns:
+                mask2 = ebook_df2['title'].astype(str).str.lower() == old_title.lower()
+                if mask2.any():
+                    if new_title: ebook_df2.loc[mask2, 'title'] = new_title
+                    if new_author: ebook_df2.loc[mask2, 'author'] = new_author
+                    modified = True
+            if modified:
+                save_excel(pdf_df2, ebook_df2)
+                messagebox.showinfo("Success", "Book updated.")
+                popup.destroy()
+            else:
+                messagebox.showwarning("Not found", "No book found with that title.")
+
+        btns = tb.Frame(frm)
+        btns.pack(fill="x", pady=(6,0))
+        tb.Button(btns, text="Update", bootstyle="primary", width=BTN_WIDTH, command=do_modify).pack(side="left", padx=6)
+        tb.Button(btns, text="Cancel", bootstyle="secondary", width=BTN_WIDTH, command=popup.destroy).pack(side="right", padx=6)
+
+    def management_search(self):
         pdf_df, ebook_df = load_excel()
-        win = tb.Toplevel(self.root)
-        win.title("Search Book")
-        win.geometry("400x350")
-        tb.Label(win, text="Search by Title:", font=LABEL_FONT).pack(pady=10)
-        q_var = tb.StringVar()
-        tb.Entry(win, textvariable=q_var).pack(pady=5)
-        text_box = tk.Text(win, wrap="word", height=10)
-        text_box.pack(fill="both", expand=True, pady=5)
+        if pdf_df.empty and ebook_df.empty:
+            messagebox.showinfo("No books", "No books in Excel.")
+            return
+        if not pdf_df.empty: pdf_df['source'] = 'pdf'
+        if not ebook_df.empty: ebook_df['source'] = 'ebook'
+        combined = pd.concat([pdf_df, ebook_df], ignore_index=True, sort=False)
+        data_list = []
+        for _, r in combined.iterrows():
+            data_list.append({k:(None if pd.isna(v) else v) for k,v in r.items()})
+        def on_select(chosen):
+            title = chosen.get('title') or ""
+            author = chosen.get('author') or ""
+            typ = chosen.get('source') or ""
+            loc = chosen.get('filepath') or chosen.get('url') or ""
+            messagebox.showinfo("Book Selected", f"Title: {title}\nAuthor: {author}\nType: {typ}\nLocation: {loc}")
+        open_search_window(self.root, data_list, title="Management: Search Books", on_select=on_select)
 
-        def perform_search():
-            q = normalize_text(q_var.get())
-            pdf_res = pdf_df[pdf_df["title"].apply(lambda x: q in normalize_text(x))]
-            ebook_res = ebook_df[ebook_df["title"].apply(lambda x: q in normalize_text(x))]
-            out = ""
-            if not pdf_res.empty:
-                out += "📘 Book PDFs:\n"
-                for i, r in pdf_res.iterrows():
-                    out += f"{r['title']} — {r['author']}\n"
-            if not ebook_res.empty:
-                out += "\n🌐 E-Books:\n"
-                for i, r in ebook_res.iterrows():
-                    out += f"{r['title']} — {r['author']}\n"
-            text_box.delete(1.0, "end")
-            text_box.insert("end", out or "No match found.")
-
-        tb.Button(win, text="Search", bootstyle="primary", command=perform_search).pack(pady=10)
-
-    # ✅ Modified Show All Books
     def show_all_books(self):
         pdf_df, ebook_df = load_excel()
         out = ""
         if not pdf_df.empty:
-            out += "📘 Book PDFs:\n"
-            for i, r in pdf_df.iterrows():
-                out += f"{i+1}. {r.get('title','')} — {r.get('author','')}\n"
-            out += "\n"
+            out += "📘 Book PDFs:\n" + pdf_df.to_string(index=False) + "\n\n"
         if not ebook_df.empty:
-            out += "🌐 E-Books:\n"
-            for i, r in ebook_df.iterrows():
-                out += f"{i+1}. {r.get('title','')} — {r.get('author','')}\n"
-        messagebox.showinfo("All Books", out or "No books found.")
+            out += "🌐 E-Books:\n" + ebook_df.to_string(index=False)
+        if not out:
+            out = "No books found."
+        messagebox.showinfo("All Books", out)
 
-
-        # ---------- CUSTOMER (continued) ----------
-    def customer_menu(self):
-        # Popup for Register / Login - matches original behavior
+    # ---------- customer ----------
+    def customer_entry(self):
         popup = tb.Toplevel(self.root)
         popup.title("Customer - Register / Login")
         popup.geometry(f"{POPUP_W}x{POPUP_H}")
@@ -384,6 +613,7 @@ class LibraryApp:
             conn.close()
 
     def cleanup_expired_issues_for_user(self, username):
+        # Remove expired issues for everyone (keeps logic same as original) but we could restrict to username if desired
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         try:
             now_iso = datetime.now().isoformat()
@@ -467,14 +697,14 @@ class LibraryApp:
             rd = get_chosen_by_title()
             if not rd: return
             if rd.get('source') == 'pdf':
-                # === MODIFIED: search only in same directory by title ===
-                title = sanitize_filename(str(rd.get('title') or "").strip())
-                same_dir = os.path.dirname(__file__)
-                filepath = os.path.join(same_dir, f"{title}.pdf")
+                filepath = ""
+                for col in ['filepath','path','file path','file','file_path']:
+                    if col in rd and rd.get(col):
+                        filepath = str(rd.get(col)).strip(); break
                 if filepath and os.path.exists(filepath):
                     open_pdf_in_acrobat(filepath)
                 else:
-                    messagebox.showerror("Not found", f"PDF not found in same directory:\n{filepath}")
+                    messagebox.showerror("Not found", f"PDF not found:\n{filepath}")
             else:
                 url = ""
                 for col in ['url','link','website']:
@@ -556,22 +786,29 @@ class LibraryApp:
         frm = tb.Frame(win, padding=12); frm.pack(fill="both", expand=True)
         tb.Label(frm, text=f"My books — {self.current_user}", font=HEADER_FONT).pack(pady=(0,10))
 
+        # --- Modified layout: use grid with equal-weight columns so Issued and Purchased get equal width ---
         content_frame = tb.Frame(frm)
+        # pack content_frame first so it expands vertically; bottom button frame will be packed afterwards
         content_frame.pack(fill="both", expand=True, padx=4, pady=(4,0))
+
+        # configure equal weights so left and right expand equally
         content_frame.columnconfigure(0, weight=1)
         content_frame.columnconfigure(1, weight=1)
         content_frame.rowconfigure(0, weight=1)
 
         left = tb.Frame(content_frame)
         left.grid(row=0, column=0, sticky="nsew", padx=(8,4), pady=8)
+
         right = tb.Frame(content_frame)
         right.grid(row=0, column=1, sticky="nsew", padx=(4,8), pady=8)
 
         tb.Label(left, text="Issued (active)", font=LABEL_FONT).pack(anchor="n")
         lb_issued = tk.Listbox(left, width=50, height=20); lb_issued.pack(fill="both", expand=True, padx=4, pady=(6,4))
+
         tb.Label(right, text="Purchased", font=LABEL_FONT).pack(anchor="n")
         lb_purchased = tk.Listbox(right, width=50, height=20); lb_purchased.pack(fill="both", expand=True, padx=4, pady=(6,4))
 
+        # load data from DB
         conn = sqlite3.connect(DB_PATH); c = conn.cursor()
         c.execute("SELECT id, title, author, source, location, issue_date, expiry_date FROM issued_books WHERE username=?", (self.current_user,))
         issued_rows = c.fetchall()
@@ -599,20 +836,11 @@ class LibraryApp:
             label = lb_issued.get(sel[0]); info = issued_map.get(label)
             if not info: messagebox.showerror("Error", "Info missing."); return
             if info['source']=='pdf':
-                # read from same directory by title as fallback if stored path missing
-                if info['location'] and os.path.exists(info['location']):
-                    open_pdf_in_acrobat(info['location'])
-                else:
-                    candidate = os.path.join(os.path.dirname(__file__), f"{sanitize_filename(info['title'])}.pdf")
-                    if os.path.exists(candidate):
-                        open_pdf_in_acrobat(candidate)
-                    else:
-                        messagebox.showerror("Missing", "PDF file not found.")
+                if info['location'] and os.path.exists(info['location']): open_pdf_in_acrobat(info['location'])
+                else: messagebox.showerror("Missing", "PDF file not found.")
             else:
-                if info['location'] and (info['location'].startswith("http://") or info['location'].startswith("https://")):
-                    try_open_url_in_chrome(info['location'])
-                else:
-                    messagebox.showerror("Missing", "URL missing/invalid.")
+                if info['location'] and (info['location'].startswith("http://") or info['location'].startswith("https://")): try_open_url_in_chrome(info['location'])
+                else: messagebox.showerror("Missing", "URL missing/invalid.")
 
         def return_issued():
             sel = lb_issued.curselection()
@@ -632,11 +860,7 @@ class LibraryApp:
                 else:
                     downloads = get_downloads_folder(); candidate = os.path.join(downloads, f"{sanitize_filename(info['title'])}.pdf")
                     if os.path.exists(candidate): open_pdf_in_acrobat(candidate)
-                    else:
-                        # fallback: check same directory by title
-                        candidate2 = os.path.join(os.path.dirname(__file__), f"{sanitize_filename(info['title'])}.pdf")
-                        if os.path.exists(candidate2): open_pdf_in_acrobat(candidate2)
-                        else: messagebox.showerror("Missing", "PDF not found locally.")
+                    else: messagebox.showerror("Missing", "PDF not found locally.")
             else:
                 if info['location'] and (info['location'].startswith("http://") or info['location'].startswith("https://")): try_open_url_in_chrome(info['location'])
                 else: messagebox.showerror("Missing", "URL missing/invalid.")
@@ -653,6 +877,7 @@ class LibraryApp:
             try: shutil.copy2(src, dst); messagebox.showinfo("Downloaded", f"✅ Book downloaded to:\n{dst}")
             except Exception as e: messagebox.showerror("Error", f"Download failed:\n{e}")
 
+        # bottom button frame (packed AFTER content_frame so it appears under the lists)
         bframe = tb.Frame(frm)
         bframe.pack(fill="x", pady=(6,4), padx=6)
         tb.Button(bframe, text="Open Issued", bootstyle="primary", width=BTN_WIDTH, command=open_issued).grid(row=0,column=0,padx=6)
@@ -661,9 +886,11 @@ class LibraryApp:
         tb.Button(bframe, text="Download Purchased", bootstyle="success", width=BTN_WIDTH, command=download_purchased).grid(row=0,column=3,padx=6)
         tb.Button(bframe, text="Close", bootstyle="light", width=BTN_WIDTH, command=win.destroy).grid(row=0,column=4,padx=6)
 
+    # ---------- run ----------
+    def run(self):
+        self.root.mainloop()
 
-# ---------- run ----------
+# ---------- main ----------
 if __name__ == "__main__":
     app = LibraryApp()
     app.run()
-
